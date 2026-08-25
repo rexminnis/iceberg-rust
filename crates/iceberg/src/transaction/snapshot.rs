@@ -462,10 +462,20 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
         for data_file in snapshot_produce_operation.removed_files() {
+            // A removed file may predate a partition-spec evolution — its
+            // partition struct is shaped by ITS spec, and pathing it with the
+            // table's default spec mis-types the values (found live: a
+            // timestamptz identity partition pathed through a day() default
+            // spec panicked in Datum's Display). Fall back to the default
+            // spec only when the file's spec id is unknown.
+            let file_spec = table_metadata
+                .partition_spec_by_id(data_file.partition_spec_id)
+                .cloned()
+                .unwrap_or_else(|| table_metadata.default_partition_spec().clone());
             summary_collector.remove_file(
                 data_file,
                 table_metadata.current_schema().clone(),
-                table_metadata.default_partition_spec().clone(),
+                file_spec,
             );
         }
 
