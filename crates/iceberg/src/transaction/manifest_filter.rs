@@ -97,7 +97,6 @@ impl ManifestFilterManager {
         let mut pending_deletes: HashSet<String> = self.deleted_files.clone();
 
         let file_io = base.file_io().clone();
-        let default_spec_id = base.metadata().default_partition_spec_id();
         let mut filtered = Vec::with_capacity(manifests.len());
 
         for manifest_file in manifests {
@@ -114,23 +113,15 @@ impl ManifestFilterManager {
                 continue;
             }
 
-            // `new_manifest_writer` writes with the table's DEFAULT partition spec.
-            // Re-emitting entries whose partition values were shaped by a different spec
-            // would mis-describe their partitioning, so refuse loudly instead. Lifting
-            // this needs a writer parameterized by the source manifest's spec.
-            if manifest_file.partition_spec_id != default_spec_id {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    format!(
-                        "Cannot filter manifest written with partition spec {} (table default \
-                         is {}): rewriting entries across partition specs is not supported yet",
-                        manifest_file.partition_spec_id, default_spec_id
-                    ),
-                ));
-            }
-
             // Rewrite the manifest, re-emitting the survivors as existing entries.
-            let mut writer = sp.new_manifest_writer(manifest_file.content)?;
+            // The filtered manifest is written with the SOURCE manifest's partition
+            // spec — survivors' partition values were shaped by it, and a table that
+            // has evolved its spec still carries old-spec manifests (Java behaves the
+            // same way: filtered manifests keep their spec).
+            let mut writer = sp.new_manifest_writer_with_spec(
+                manifest_file.content,
+                manifest_file.partition_spec_id,
+            )?;
             let mut survivors = 0usize;
             for entry in entries {
                 // Deleted entries are informational only; never carried forward.
@@ -475,11 +466,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_filter_refuses_manifest_from_a_different_partition_spec() {
+    async fn test_filter_errors_on_manifest_with_unknown_partition_spec() {
         let (table, _tmp_dir) = make_fs_table();
         let mut manifest = write_data_manifest(&table, &["data/a.parquet"]).await;
-        // Simulate a manifest written under an older partition spec: rewriting its
-        // entries with the default spec would mis-describe their partitioning.
+        // A manifest may legitimately carry a NON-default spec (spec evolution) —
+        // the filter now re-emits survivors under the source spec. But a spec id
+        // absent from table metadata is corrupt input and must error.
         manifest.partition_spec_id = 99;
         let mut producer = make_producer(&table);
 
@@ -491,6 +483,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.to_string().contains("Partition spec 99 not found"));
     }
 }

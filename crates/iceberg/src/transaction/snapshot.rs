@@ -279,6 +279,20 @@ impl<'a> SnapshotProducer<'a> {
         &mut self,
         content: ManifestContentType,
     ) -> Result<ManifestWriter> {
+        let default_spec_id = self.table.metadata().default_partition_spec().spec_id();
+        self.new_manifest_writer_with_spec(content, default_spec_id)
+    }
+
+    /// Like [`new_manifest_writer`](Self::new_manifest_writer), but writing with the
+    /// partition spec identified by `spec_id`. Filtering an existing manifest must
+    /// re-emit survivors under the SOURCE manifest's spec — their partition values
+    /// were shaped by it, and describing them with the table's default spec would
+    /// corrupt partition metadata after a spec evolution.
+    pub(crate) fn new_manifest_writer_with_spec(
+        &mut self,
+        content: ManifestContentType,
+        spec_id: i32,
+    ) -> Result<ManifestWriter> {
         let snapshot_id = self.resolve_snapshot_id();
         let new_manifest_path = format!(
             "{}/{}/{}-m{}.{}",
@@ -288,16 +302,24 @@ impl<'a> SnapshotProducer<'a> {
             self.manifest_counter.next().unwrap(),
             DataFileFormat::Avro
         );
+        let partition_spec = self
+            .table
+            .metadata()
+            .partition_spec_by_id(spec_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Partition spec {spec_id} not found in table metadata"),
+                )
+            })?
+            .as_ref()
+            .clone();
         let output_file = self.table.file_io().new_output(new_manifest_path)?;
         let builder = ManifestWriterBuilder::new(
             output_file,
             Some(snapshot_id),
             self.table.metadata().current_schema().clone(),
-            self.table
-                .metadata()
-                .default_partition_spec()
-                .as_ref()
-                .clone(),
+            partition_spec,
         );
         match self.table.metadata().format_version() {
             FormatVersion::V1 => Ok(builder.build_v1()),
